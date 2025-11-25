@@ -243,7 +243,7 @@ def combine_video(media_path: str, layer_path: str, output_path: str, progress=N
 
 
 def process_zip_file(zip_path: str, output_dir: str, keep_originals: bool = True, 
-                     progress=None, task_id=None) -> bool:
+                     progress=None, task_id=None) -> Tuple[bool, Optional[str], bool]:
     """
     Process a single zip file containing media and layer.
     
@@ -255,9 +255,21 @@ def process_zip_file(zip_path: str, output_dir: str, keep_originals: bool = True
         task_id: Optional task ID for progress tracking
     
     Returns:
-        True if successful, False otherwise
+        (success, error_message, already_existed) tuple
     """
     zip_name = os.path.basename(zip_path)
+    
+    # Check if already processed - look for file with same name but different extension
+    zip_basename = os.path.splitext(os.path.basename(zip_path))[0]
+    output_dir_path = Path(output_dir)
+    
+    # Check for common media extensions
+    for ext in ['.jpg', '.jpeg', '.mp4', '.png']:
+        potential_output = output_dir_path / f"{zip_basename}{ext}"
+        if potential_output.exists():
+            if progress and task_id:
+                progress.update(task_id, description=f"[dim]⊘ Already exists: {zip_name[:40]}")
+            return True, None, True  # Success, no error, already existed
     
     if progress and task_id:
         progress.update(task_id, description=f"[cyan]Analyzing {zip_name[:40]}...")
@@ -267,9 +279,10 @@ def process_zip_file(zip_path: str, output_dir: str, keep_originals: bool = True
         media_file, layer_file, media_type = find_media_and_layer(zip_path)
         
         if not media_file or not layer_file:
+            error_msg = f"Missing files in {zip_name}: media={media_file}, layer={layer_file}"
             if progress and task_id:
                 progress.update(task_id, description=f"[yellow]⊘ Skipped {zip_name[:40]} (missing files)")
-            return False
+            return False, error_msg, False
         
         # Create temporary directory for extraction
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -282,7 +295,6 @@ def process_zip_file(zip_path: str, output_dir: str, keep_originals: bool = True
                 layer_path = zf.extract(layer_file, temp_dir)
             
             # Determine output filename (use zip filename + media extension)
-            zip_basename = os.path.splitext(os.path.basename(zip_path))[0]
             media_ext = os.path.splitext(media_path)[1]
             base_name = f"{zip_basename}{media_ext}"
             output_path = os.path.join(output_dir, base_name)
@@ -293,23 +305,26 @@ def process_zip_file(zip_path: str, output_dir: str, keep_originals: bool = True
             elif media_type == 'video':
                 success = combine_video(media_path, layer_path, output_path, progress, task_id)
             else:
+                error_msg = f"Unknown media type for {zip_name}"
                 if progress and task_id:
                     progress.update(task_id, description=f"[red]✗ Unknown media type")
-                return False
+                return False, error_msg, False
             
             if success:
                 # Remove original zip if requested
                 if not keep_originals:
                     os.remove(zip_path)
                 
-                return True
+                return True, None, False  # Success, no error, newly processed
             else:
-                return False
+                error_msg = f"Failed to combine {zip_name} (type: {media_type})"
+                return False, error_msg, False
     
     except Exception as e:
+        error_msg = f"Exception processing {zip_name}: {type(e).__name__}: {str(e)}"
         if progress and task_id:
             progress.update(task_id, description=f"[red]✗ Error: {str(e)[:40]}")
-        return False
+        return False, error_msg, False
 
 
 def main():
@@ -371,6 +386,8 @@ def main():
     # Process files with rich progress bars and multithreading
     success_count = 0
     skip_count = 0
+    already_exists_count = 0
+    failures: List[Tuple[str, str]] = []  # (filename, error_message)
     lock = threading.Lock()
     
     # Create per-thread tasks for progress tracking
@@ -402,11 +419,11 @@ def main():
         
         def process_with_progress(zip_path: Path, worker_id: int):
             """Wrapper to process a zip file with progress tracking."""
-            nonlocal success_count, skip_count
+            nonlocal success_count, skip_count, already_exists_count
             
             task_id = thread_tasks[worker_id]
             
-            result = process_zip_file(
+            result, error_msg, already_existed = process_zip_file(
                 str(zip_path),
                 str(output_dir),
                 keep_originals=not args.remove_originals,
@@ -417,13 +434,18 @@ def main():
             # Update counters thread-safely
             with lock:
                 if result:
-                    success_count += 1
+                    if already_existed:
+                        already_exists_count += 1
+                    else:
+                        success_count += 1
                 else:
                     skip_count += 1
+                    if error_msg:
+                        failures.append((os.path.basename(str(zip_path)), error_msg))
                 
                 # Update overall progress
                 progress.update(overall_task, advance=1,
-                              description=f"[green]Overall Progress [cyan]({success_count} done, {skip_count} skipped)")
+                              description=f"[green]Overall Progress [cyan]({success_count} new, {already_exists_count} existing, {skip_count} failed)")
             
             # Mark worker as idle
             progress.update(task_id, completed=100, 
@@ -432,38 +454,81 @@ def main():
             return result
         
         # Process files with thread pool
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = {}
-            worker_counter = 0
+        interrupted = False
+        pending_count = 0
+        
+        try:
+            with ThreadPoolExecutor(max_workers=args.threads) as executor:
+                futures = {}
+                worker_counter = 0
+                
+                # Submit all jobs
+                for zip_path in zip_files:
+                    worker_id = worker_counter % args.threads
+                    future = executor.submit(process_with_progress, zip_path, worker_id)
+                    futures[future] = (zip_path, worker_id)
+                    worker_counter += 1
+                
+                # Wait for completion
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        zip_path, worker_id = futures[future]
+                        error_msg = f"Unhandled exception: {type(e).__name__}: {str(e)}"
+                        with lock:
+                            skip_count += 1
+                            failures.append((os.path.basename(str(zip_path)), error_msg))
+        
+        except KeyboardInterrupt:
+            interrupted = True
+            console.print('\n\n[yellow]Interrupted by user. Waiting for active jobs to finish...[/yellow]')
             
-            # Submit all jobs
-            for zip_path in zip_files:
-                worker_id = worker_counter % args.threads
-                future = executor.submit(process_with_progress, zip_path, worker_id)
-                futures[future] = (zip_path, worker_id)
-                worker_counter += 1
+            # Calculate how many were pending
+            completed_count = success_count + skip_count + already_exists_count
+            pending_count = len(zip_files) - completed_count
             
-            # Wait for completion
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    zip_path, worker_id = futures[future]
-                    console.print(f"[red]Error processing {zip_path}: {e}[/red]")
-                    with lock:
-                        skip_count += 1
+            # Let running futures complete
+            for future in futures:
+                if not future.done():
+                    try:
+                        future.result(timeout=30)  # Wait up to 30s for each
+                    except Exception:
+                        pass  # Ignore errors during cleanup
     
     # Summary
     console.print('\n[bold cyan]Summary:[/bold cyan]')
     console.print(f'  Total files: [bold]{len(zip_files)}[/bold]')
-    console.print(f'  Successfully processed: [green]{success_count}[/green]')
-    console.print(f'  Skipped/Failed: [yellow]{skip_count}[/yellow]')
+    console.print(f'  Newly processed: [green]{success_count}[/green]')
+    console.print(f'  Already existed: [blue]{already_exists_count}[/blue]')
+    console.print(f'  Failed: [red]{skip_count}[/red]')
+    if interrupted and pending_count > 0:
+        console.print(f'  Pending (interrupted): [yellow]{pending_count}[/yellow]')
     console.print(f'  Output directory: [cyan]{output_dir}[/cyan]')
     
+    # Show failures if any
+    if failures:
+        console.print(f'\n[bold red]Failures ({len(failures)}):[/bold red]')
+        for filename, error_msg in failures[:20]:  # Show first 20
+            console.print(f'  [yellow]{filename}[/yellow]')
+            console.print(f'    [dim]{error_msg}[/dim]')
+        
+        if len(failures) > 20:
+            console.print(f'\n  [dim]... and {len(failures) - 20} more failures[/dim]')
+    
     if success_count > 0:
-        pct = int((success_count / len(zip_files)) * 100)
-        console.print(f'\n[green]✓ Done! {pct}% success rate[/green]')
+        total_processed = success_count + already_exists_count
+        pct = int((total_processed / len(zip_files)) * 100)
+        if interrupted:
+            console.print(f'\n[yellow]Interrupted. {pct}% complete ({success_count} new, {already_exists_count} existing)[/yellow]')
+        else:
+            console.print(f'\n[green]✓ Done! {pct}% complete ({success_count} new, {already_exists_count} existing)[/green]')
+    elif already_exists_count > 0:
+        console.print(f'\n[blue]All files already processed ({already_exists_count} files)[/blue]')
+    elif interrupted:
+        console.print(f'\n[yellow]Interrupted before completion[/yellow]')
 
 
 if __name__ == '__main__':
     main()
+
