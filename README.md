@@ -53,11 +53,13 @@ python add_exif.py -i working_folder --threads 4
 ### add_exif.py
 - `-i, --input` (required): Input directory containing media files
 - `--threads` (default: 4): Number of concurrent worker threads
+- `--process-type` (default: `all`): What to process - `all` (EXIF+filesystem dates), `exif` (EXIF/metadata only), `filesystem` (filesystem dates only)
 - `--pattern` (default: all files): File pattern to match
 - `--dry-run`: Preview EXIF data without modifying files
 
 ## Requirements
 - Python 3.7+
 - ffmpeg (optional, for video metadata)
+- pywin32 (Windows only, for filesystem date modification)
 
 

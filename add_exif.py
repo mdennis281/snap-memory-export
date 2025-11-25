@@ -49,6 +49,20 @@ try:
 except ImportError:
     HAS_FFMPEG = False
 
+# Platform-specific imports for filesystem date modification
+if sys.platform == 'win32':
+    try:
+        import pywintypes
+        import win32file
+        import win32con
+        HAS_WIN32 = True
+    except ImportError:
+        HAS_WIN32 = False
+        print("Warning: pywin32 not found. Filesystem date modification will be disabled.")
+        print("Install with: pip install pywin32")
+else:
+    HAS_WIN32 = False
+
 
 # Regex patterns for filename parsing
 # ISO date format: 2024-01-15T14-30-00 or 2024-01-15
@@ -135,6 +149,45 @@ def decimal_to_dms(decimal: float, is_latitude: bool = True) -> Tuple[Tuple[int,
     seconds_rational = (int(seconds * 1000), 1000)
     
     return ((degrees, 1), (minutes, 1), seconds_rational, ref)
+
+
+def set_filesystem_dates(file_path: str, dt: datetime) -> bool:
+    """
+    Set filesystem creation and modification dates.
+    
+    Args:
+        file_path: Path to the file
+        dt: DateTime to set
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Convert datetime to timestamp
+        timestamp = dt.timestamp()
+        
+        # Set modification and access time (works on all platforms)
+        os.utime(file_path, (timestamp, timestamp))
+        
+        # Set creation time on Windows
+        if HAS_WIN32 and sys.platform == 'win32':
+            # Convert to Windows FILETIME
+            wintime = pywintypes.Time(dt)
+            handle = win32file.CreateFile(
+                file_path,
+                win32con.GENERIC_WRITE,
+                win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
+                None,
+                win32con.OPEN_EXISTING,
+                win32con.FILE_ATTRIBUTE_NORMAL,
+                None
+            )
+            win32file.SetFileTime(handle, wintime, None, None)
+            handle.close()
+        
+        return True
+    except Exception:
+        return False
 
 
 def add_exif_to_image(image_path: str, dt: Optional[datetime], lat: Optional[float], lon: Optional[float]) -> bool:
@@ -254,12 +307,13 @@ def add_metadata_to_video(video_path: str, dt: Optional[datetime], lat: Optional
         return False
 
 
-def process_file(file_path: str, progress=None, task_id=None) -> Tuple[bool, str]:
+def process_file(file_path: str, process_type: str = 'all', progress=None, task_id=None) -> Tuple[bool, str]:
     """
-    Process a single media file to add EXIF data.
+    Process a single media file to add EXIF data and/or modify filesystem dates.
     
     Args:
         file_path: Path to the file
+        process_type: Type of processing - 'all', 'exif', or 'filesystem'
         progress: Optional Rich Progress object
         task_id: Optional task ID for progress tracking
     
@@ -281,60 +335,85 @@ def process_file(file_path: str, progress=None, task_id=None) -> Tuple[bool, str
             progress.update(task_id, description=f"[yellow]⊘ Skipped {filename[:50]} (no metadata)")
         return False, "No metadata found in filename"
     
-    # Process based on file type
+    success_parts = []
+    failed_parts = []
+    
+    # Process based on file type and process_type
     if ext in ['.jpg', '.jpeg']:
-        if progress and task_id:
-            progress.update(task_id, description=f"[cyan]Adding EXIF to {filename[:50]}...")
-        
-        success = add_exif_to_image(file_path, dt, lat, lon)
-        
-        if success:
-            parts = []
-            if dt:
-                parts.append(f"date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            if lat is not None:
-                parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
-            message = f"Added {', '.join(parts)}"
+        # Handle EXIF data
+        if process_type in ['all', 'exif']:
+            if progress and task_id:
+                progress.update(task_id, description=f"[cyan]Adding EXIF to {filename[:50]}...")
             
+            if add_exif_to_image(file_path, dt, lat, lon):
+                parts = []
+                if dt:
+                    parts.append(f"date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                if lat is not None:
+                    parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
+                success_parts.append(f"EXIF ({', '.join(parts)})")
+            else:
+                failed_parts.append("EXIF")
+        
+        # Handle filesystem dates
+        if process_type in ['all', 'filesystem'] and dt:
             if progress and task_id:
-                progress.update(task_id, description=f"[green]✓ {filename[:50]}")
-            return True, message
-        else:
-            if progress and task_id:
-                progress.update(task_id, description=f"[red]✗ Failed {filename[:50]}")
-            return False, "Failed to add EXIF"
+                progress.update(task_id, description=f"[cyan]Setting filesystem date for {filename[:50]}...")
+            
+            if set_filesystem_dates(file_path, dt):
+                success_parts.append(f"filesystem date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                failed_parts.append("filesystem date")
     
     elif ext in ['.mp4']:
-        if not HAS_FFMPEG:
-            if progress and task_id:
-                progress.update(task_id, description=f"[yellow]⊘ Skipped {filename[:50]} (no ffmpeg)")
-            return False, "ffmpeg not available"
-        
-        if progress and task_id:
-            progress.update(task_id, description=f"[cyan]Adding metadata to {filename[:50]}...")
-        
-        success = add_metadata_to_video(file_path, dt, lat, lon)
-        
-        if success:
-            parts = []
-            if dt:
-                parts.append(f"date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            if lat is not None:
-                parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
-            message = f"Added {', '.join(parts)}"
+        # Handle video metadata
+        if process_type in ['all', 'exif']:
+            if not HAS_FFMPEG:
+                if progress and task_id:
+                    progress.update(task_id, description=f"[yellow]⊘ Skipped {filename[:50]} (no ffmpeg)")
+                return False, "ffmpeg not available"
             
             if progress and task_id:
-                progress.update(task_id, description=f"[green]✓ {filename[:50]}")
-            return True, message
-        else:
+                progress.update(task_id, description=f"[cyan]Adding metadata to {filename[:50]}...")
+            
+            if add_metadata_to_video(file_path, dt, lat, lon):
+                parts = []
+                if dt:
+                    parts.append(f"date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+                if lat is not None:
+                    parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
+                success_parts.append(f"metadata ({', '.join(parts)})")
+            else:
+                failed_parts.append("metadata")
+        
+        # Handle filesystem dates
+        if process_type in ['all', 'filesystem'] and dt:
             if progress and task_id:
-                progress.update(task_id, description=f"[red]✗ Failed {filename[:50]}")
-            return False, "Failed to add metadata"
+                progress.update(task_id, description=f"[cyan]Setting filesystem date for {filename[:50]}...")
+            
+            if set_filesystem_dates(file_path, dt):
+                success_parts.append(f"filesystem date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                failed_parts.append("filesystem date")
     
     else:
         if progress and task_id:
             progress.update(task_id, description=f"[yellow]⊘ Skipped {filename[:50]} (unsupported)")
         return False, "Unsupported file type"
+    
+    # Determine overall success
+    if success_parts and not failed_parts:
+        if progress and task_id:
+            progress.update(task_id, description=f"[green]✓ {filename[:50]}")
+        return True, f"Added {', '.join(success_parts)}"
+    elif success_parts and failed_parts:
+        if progress and task_id:
+            progress.update(task_id, description=f"[yellow]⚠ {filename[:50]}")
+        return True, f"Partial: {', '.join(success_parts)} | Failed: {', '.join(failed_parts)}"
+    else:
+        if progress and task_id:
+            progress.update(task_id, description=f"[red]✗ Failed {filename[:50]}")
+        return False, f"Failed to add {', '.join(failed_parts) if failed_parts else 'metadata'}"
 
 
 def main():
@@ -362,6 +441,12 @@ def main():
         default=4,
         help='Number of worker threads (default: 4)'
     )
+    parser.add_argument(
+        '--process-type',
+        choices=['all', 'exif', 'filesystem'],
+        default='all',
+        help='What to process: all (EXIF+filesystem), exif (EXIF/metadata only), filesystem (filesystem dates only) (default: all)'
+    )
     
     args = parser.parse_args()
     
@@ -384,6 +469,7 @@ def main():
     
     console.print(f'[cyan]Found {len(image_files)} image(s) and {len(video_files)} video(s)[/cyan]')
     console.print(f'[cyan]Using {args.threads} worker thread(s)[/cyan]')
+    console.print(f'[cyan]Process type: {args.process_type}[/cyan]')
     console.print(f'[cyan]Input directory: {input_dir}[/cyan]')
     
     if args.dry_run:
@@ -460,6 +546,7 @@ def main():
                 
                 success, error_msg = process_file(
                     str(file_path),
+                    process_type=args.process_type,
                     progress=progress,
                     task_id=task_id
                 )
