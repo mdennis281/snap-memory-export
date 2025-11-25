@@ -1,6 +1,8 @@
 # snap-memory-export
 Bulk export Snapchat memories with EXIF data
 
+> **NOTE:** this was heavily vibe coded, but it exported my snap memories for me, will hopefully do the same for you.
+
 ## Quick Start
 
 ### 1. Get your data
@@ -14,34 +16,42 @@ pip install -r requirements.txt
 
 ### 3. Download memories
 ```bash
-python download_memories.py -i path/to/memories_history.html -o output_folder --threads 5
+python download.py -i path/to/memories_history.html -o output_folder --threads 5
 ```
 
 <img width="1055" alt="Downloader" src="https://github.com/user-attachments/assets/be2d9375-39d2-4798-b643-75854908c289" />
 
 ### 4. Combine layers (for zipped files with overlays)
 ```bash
-python combine.py -i output_folder --threads 4
+python combine_layers.py -i output_folder --threads 4
 ```
 
 <img width="909" alt="Combiner" src="https://github.com/user-attachments/assets/0a80aa47-d1cb-4a00-be65-67332e0f41c4" />
 
 ### 5. Add EXIF data (date/GPS from filenames)
 ```bash
-python add_exif.py -i output_folder
+python add_exif.py -i working_folder
 ```
 
 ## Options
 
-**download_memories.py**
-- `--threads`: Concurrent downloads (default: 5)
-- `--dry-run`: Preview without downloading
+### download.py
+- `-i, --input` (required): Path to `memories_history.html`
+- `-o, --outdir` (default: `memories_downloads`): Output directory
+- `--threads` (default: 5): Number of concurrent download threads
+- `--delay` (default: 0.0): Delay between downloads in seconds
+- `--dry-run`: Preview URLs without downloading
 
-**combine.py**
-- `--threads`: Concurrent processing (default: 4)
-- `--remove-originals`: Delete zip files after combining
+### combine_layers.py
+- `-i, --input` (required): Input directory containing zip files
+- `-o, --output` (default: same as input): Output directory for combined files
+- `--threads` (default: 4): Number of concurrent worker threads
+- `--pattern` (default: `*.zip`): File pattern to match
+- `--remove-originals`: Delete zip files after successful processing
 
-**add_exif.py**
+### add_exif.py
+- `-i, --input` (required): Input directory containing media files
+- `--pattern` (default: all files): File pattern to match
 - `--dry-run`: Preview EXIF data without modifying files
 
 ## Requirements
