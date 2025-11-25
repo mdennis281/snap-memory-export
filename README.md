@@ -16,22 +16,23 @@ pip install -r requirements.txt
 
 ### 3. Download memories
 ```bash
-python download.py -i path/to/memories_history.html -o output_folder --threads 5
+python download.py -i path/to/memories_history.html -o working_folder --threads 5
 ```
 
 <img width="1055" alt="Downloader" src="https://github.com/user-attachments/assets/be2d9375-39d2-4798-b643-75854908c289" />
 
 ### 4. Combine layers (for zipped files with overlays)
 ```bash
-python combine_layers.py -i output_folder --threads 4
+python combine_layers.py -i working_folder --threads 4
 ```
 
 <img width="909" alt="Combiner" src="https://github.com/user-attachments/assets/0a80aa47-d1cb-4a00-be65-67332e0f41c4" />
 
 ### 5. Add EXIF data (date/GPS from filenames)
 ```bash
-python add_exif.py -i working_folder
+python add_exif.py -i working_folder --threads 4
 ```
+<img width="1072" alt="exif" src="https://github.com/user-attachments/assets/8102d984-cb81-4996-953f-1b2cb52fd37c" />
 
 ## Options
 
@@ -51,6 +52,7 @@ python add_exif.py -i working_folder
 
 ### add_exif.py
 - `-i, --input` (required): Input directory containing media files
+- `--threads` (default: 4): Number of concurrent worker threads
 - `--pattern` (default: all files): File pattern to match
 - `--dry-run`: Preview EXIF data without modifying files
 
