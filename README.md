@@ -17,10 +17,14 @@ pip install -r requirements.txt
 python download_memories.py -i path/to/memories_history.html -o output_folder --threads 5
 ```
 
+<img width="1055" alt="Downloader" src="https://github.com/user-attachments/assets/be2d9375-39d2-4798-b643-75854908c289" />
+
 ### 4. Combine layers (for zipped files with overlays)
 ```bash
 python combine.py -i output_folder --threads 4
 ```
+
+<img width="909" alt="Combiner" src="https://github.com/user-attachments/assets/0a80aa47-d1cb-4a00-be65-67332e0f41c4" />
 
 ### 5. Add EXIF data (date/GPS from filenames)
 ```bash
