@@ -12,9 +12,11 @@ import argparse
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rich.console import Console
 from rich.progress import (
@@ -51,8 +53,9 @@ except ImportError:
 # Regex patterns for filename parsing
 # ISO date format: 2024-01-15T14-30-00 or 2024-01-15
 ISO_DATE_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2})-(\d{2})-(\d{2}))?')
-# Coordinates: -37.7749_-122.4194 or 37.7749_122.4194
-COORDS_PATTERN = re.compile(r'(-?\d{1,3}\.\d+)_(-?\d{1,3}\.\d+)')
+# Coordinates: after date separator, look for lat_lon pattern
+# Match: -29.80406_-94.8984 (note the leading - is separator, not sign)
+COORDS_PATTERN = re.compile(r'-(\d{1,3}\.\d+)_(-?\d{1,3}\.\d+)')
 
 
 def parse_filename(filename: str) -> Tuple[Optional[datetime], Optional[float], Optional[float]]:
@@ -353,6 +356,12 @@ def main():
         default='*',
         help='File pattern to match (default: all files)'
     )
+    parser.add_argument(
+        '--threads',
+        type=int,
+        default=4,
+        help='Number of worker threads (default: 4)'
+    )
     
     args = parser.parse_args()
     
@@ -374,6 +383,7 @@ def main():
         sys.exit(0)
     
     console.print(f'[cyan]Found {len(image_files)} image(s) and {len(video_files)} video(s)[/cyan]')
+    console.print(f'[cyan]Using {args.threads} worker thread(s)[/cyan]')
     console.print(f'[cyan]Input directory: {input_dir}[/cyan]')
     
     if args.dry_run:
@@ -384,6 +394,10 @@ def main():
     # Process files
     success_count = 0
     skip_count = 0
+    failures: List[Tuple[str, str]] = []  # (filename, error_message)
+    lock = threading.Lock()
+    interrupted = False
+    pending_count = 0
     
     if args.dry_run:
         # Dry run - just show what would be done
@@ -406,7 +420,10 @@ def main():
                 skip_count += 1
             console.print()
     else:
-        # Actually process files with progress bars
+        # Actually process files with progress bars and multithreading
+        # Create per-thread tasks for progress tracking
+        thread_tasks: Dict[int, int] = {}
+        
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -423,48 +440,121 @@ def main():
                 total=len(all_files)
             )
             
-            # Current file task
-            current_task = progress.add_task(
-                "[cyan]Waiting...", 
-                total=100
-            )
+            # Create worker thread tasks
+            for i in range(args.threads):
+                task_id = progress.add_task(
+                    f"[dim]Worker #{i+1}: Idle", 
+                    total=100
+                )
+                thread_tasks[i] = task_id
             
-            for file_path in all_files:
+            def process_with_progress(file_path: Path, worker_id: int):
+                """Wrapper to process a file with progress tracking."""
+                nonlocal success_count, skip_count
+                
+                task_id = thread_tasks[worker_id]
                 filename = os.path.basename(str(file_path))
                 
-                # Reset current task
-                progress.update(current_task, completed=0, total=100)
+                # Reset task
+                progress.update(task_id, completed=0, total=100)
                 
-                success, message = process_file(
+                success, error_msg = process_file(
                     str(file_path),
                     progress=progress,
-                    task_id=current_task
+                    task_id=task_id
                 )
                 
-                if success:
-                    success_count += 1
-                else:
-                    skip_count += 1
+                # Update counters thread-safely
+                with lock:
+                    if success:
+                        success_count += 1
+                    else:
+                        skip_count += 1
+                        if error_msg:
+                            failures.append((filename, error_msg))
+                    
+                    # Update overall progress
+                    progress.update(overall_task, advance=1,
+                                  description=f"[green]Overall Progress [cyan]({success_count} done, {skip_count} skipped)")
                 
-                # Update overall progress
-                progress.update(overall_task, advance=1,
-                              description=f"[green]Overall Progress [cyan]({success_count} done, {skip_count} skipped)")
+                # Mark worker as idle
+                progress.update(task_id, completed=100, 
+                              description=f"[dim]Worker #{worker_id+1}: Idle")
+                
+                return success
             
-            # Final update
-            progress.update(current_task, completed=100, 
-                           description="[green]✓ All files processed")
+            # Process files with thread pool
+            interrupted = False
+            pending_count = 0
+            
+            try:
+                with ThreadPoolExecutor(max_workers=args.threads) as executor:
+                    futures = {}
+                    worker_counter = 0
+                    
+                    # Submit all jobs
+                    for file_path in all_files:
+                        worker_id = worker_counter % args.threads
+                        future = executor.submit(process_with_progress, file_path, worker_id)
+                        futures[future] = (file_path, worker_id)
+                        worker_counter += 1
+                    
+                    # Wait for completion
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            file_path, worker_id = futures[future]
+                            error_msg = f"Unhandled exception: {type(e).__name__}: {str(e)}"
+                            filename = os.path.basename(str(file_path))
+                            with lock:
+                                skip_count += 1
+                                failures.append((filename, error_msg))
+            
+            except KeyboardInterrupt:
+                interrupted = True
+                console.print('\n\n[yellow]Interrupted by user. Waiting for active jobs to finish...[/yellow]')
+                
+                # Calculate how many were pending
+                completed_count = success_count + skip_count
+                pending_count = len(all_files) - completed_count
+                
+                # Let running futures complete
+                for future in futures:
+                    if not future.done():
+                        try:
+                            future.result(timeout=30)  # Wait up to 30s for each
+                        except Exception:
+                            pass  # Ignore errors during cleanup
     
     # Summary
     console.print('\n[bold cyan]Summary:[/bold cyan]')
     console.print(f'  Total files: [bold]{len(all_files)}[/bold]')
     console.print(f'  Successfully processed: [green]{success_count}[/green]')
     console.print(f'  Skipped: [yellow]{skip_count}[/yellow]')
+    if not args.dry_run and interrupted and pending_count > 0:
+        console.print(f'  Pending (interrupted): [yellow]{pending_count}[/yellow]')
+    
+    # Show failures if any
+    if failures and not args.dry_run:
+        console.print(f'\n[bold red]Failures ({len(failures)}):[/bold red]')
+        for filename, error_msg in failures[:20]:  # Show first 20
+            console.print(f'  [yellow]{filename}[/yellow]')
+            console.print(f'    [dim]{error_msg}[/dim]')
+        
+        if len(failures) > 20:
+            console.print(f'\n  [dim]... and {len(failures) - 20} more failures[/dim]')
     
     if success_count > 0 and not args.dry_run:
         pct = int((success_count / len(all_files)) * 100)
-        console.print(f'\n[green]✓ Done! {pct}% success rate[/green]')
+        if interrupted:
+            console.print(f'\n[yellow]Interrupted. {pct}% complete[/yellow]')
+        else:
+            console.print(f'\n[green]✓ Done! {pct}% success rate[/green]')
     elif args.dry_run:
         console.print(f'\n[yellow]Dry run complete. Use without --dry-run to apply changes.[/yellow]')
+    elif interrupted:
+        console.print(f'\n[yellow]Interrupted before completion[/yellow]')
 
 
 if __name__ == '__main__':
